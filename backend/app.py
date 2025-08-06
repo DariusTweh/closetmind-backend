@@ -39,33 +39,46 @@ def tag_clothing():
 
         prompt = """
         You are a fashion tagging assistant for ClosetMind.
-        Classify clothing items...
+
+        Classify clothing items into these categories:
+        - "top": shirts, blouses, tanks, crop tops, etc.
+        - "bottom": pants, jeans, shorts, skirts, etc.
+        - "shoes": sneakers, boots, heels, etc.
+        - "outerwear": jackets and coats
+        - "accessory": hats, bags, scarves, jewelry
+        - "layer": sweaters, hoodies, cardigans — items worn over tops but under jackets
+        - "onepiece": dresses, jumpsuits, rompers — full-body garments that combine top and bottom
+
+        Return raw JSON in this format:
+        {
+          "main_category": one of ["top", "bottom", "shoes", "outerwear", "accessory", "layer", "onepiece"],
+          "type": string,
+          "primary_color": string,
+          "secondary_colors": [string],
+          "pattern_description": string,
+          "vibe_tags": [string],
+          "season": one of ["spring", "summer", "fall", "winter", "all"]
+        }
         """
 
         print("🛠 Sending request to OpenAI for tagging...")
-        response = client.responses.create(
+        completion = client.chat.completions.create(
             model="gpt-4.1-mini",
-            input=[{
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": prompt},
-                    {"type": "input_image", "image_url": base64_image, "detail": "low"}
-                ],
-            }],
-            response_format={"type": "json_object"}
+            temperature=0,
+            response_format={"type": "json_object"},  # ✅ Forces pure JSON
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": base64_image, "detail": "low"}}
+                    ]
+                }
+            ]
         )
 
-        print(f"📡 Raw OpenAI Response: {response}")
-        raw_text = getattr(response, "output_text", "").strip()
+        raw_text = completion.choices[0].message.content.strip()
         print(f"📝 Parsed output_text: {raw_text}")
-
-        if not raw_text:
-            print("❌ No text output from GPT")
-            return jsonify({"error": "No output from GPT", "raw": str(response)}), 500
-
-        # Clean code fences
-        raw_text = re.sub(r"^```[a-zA-Z]*\n?", "", raw_text)
-        raw_text = re.sub(r"```$", "", raw_text)
 
         tags = json.loads(raw_text)
         print(f"✅ Final Tags: {tags}")
