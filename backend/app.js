@@ -1,21 +1,17 @@
+// backend/index.js
 import express from "express";
 import fetch from "node-fetch";
 import OpenAI from "openai";
-import dotenv from "dotenv";
 import bodyParser from "body-parser";
-import path from "path";
-import { fileURLToPath } from "url";
+import dotenv from "dotenv";
 
 dotenv.config();
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
 const app = express();
-const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-
 app.use(bodyParser.json({ limit: "50mb" }));
 
+const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+// Helper: download image as Base64
 async function downloadImageAsBase64(imageUrl) {
   console.log(`🔍 Downloading image: ${imageUrl}`);
   const res = await fetch(imageUrl);
@@ -29,6 +25,7 @@ async function downloadImageAsBase64(imageUrl) {
   return `data:image/jpeg;base64,${base64}`;
 }
 
+// -------------------- /tag --------------------
 app.post("/tag", async (req, res) => {
   console.log("\n=== [TAG ENDPOINT CALLED] ===");
   try {
@@ -44,47 +41,58 @@ app.post("/tag", async (req, res) => {
 
     const prompt = `
       You are a fashion tagging assistant for ClosetMind.
+
       Classify clothing items into these categories:
-      - "top": shirts, blouses, tanks, crop tops, etc.
-      - "bottom": pants, jeans, shorts, skirts, etc.
-      - "shoes": sneakers, boots, heels, etc.
-      - "outerwear": jackets and coats
-      - "accessory": hats, bags, scarves, jewelry
-      - "layer": sweaters, hoodies, cardigans — items worn over tops but under jackets
-      - "onepiece": dresses, jumpsuits, rompers — full-body garments that combine top and bottom
-      Return raw JSON in this format:
+      Generate a "name" field that gives a short, human-readable label for the item, no more than 3-4 words.
+      Avoid brand names, focus on visible features (color, fit, material, cut).
+
+      Categories:
+      - "top"
+      - "bottom"
+      - "shoes"
+      - "outerwear"
+      - "accessory"
+      - "layer"
+      - "onepiece"
+
+      Return raw JSON:
       {
-        "main_category": one of ["top", "bottom", "shoes", "outerwear", "accessory", "layer", "onepiece"],
-        "type": string,
-        "primary_color": string,
-        "secondary_colors": [string],
-        "pattern_description": string,
-        "vibe_tags": [string],
-        "season": one of ["spring", "summer", "fall", "winter", "all"]
+        "name": "",
+        "main_category": "...",
+        "type": "",
+        "primary_color": "",
+        "secondary_colors": [],
+        "pattern_description": "",
+        "vibe_tags": [],
+        "season": "spring/summer/fall/winter/all"
       }
     `;
 
-    console.log("🛠 Sending request to OpenAI...");
-    const completion = await client.chat.completions.create({
+    const completion = await client.responses.create({
       model: "gpt-4.1-mini",
-      temperature: 0,
-      response_format: { type: "json_object" },
-      messages: [
+      input: [
         {
           role: "user",
           content: [
-            { type: "text", text: prompt },
-            { type: "image_url", image_url: { url: base64Image, detail: "low" } },
+            { type: "input_text", text: prompt },
+            { type: "input_image", image_url: base64Image, detail: "low" },
           ],
         },
       ],
     });
 
-    const rawText = completion.choices[0].message.content.trim();
-    console.log("📝 Parsed output_text:", rawText);
+    let raw = completion.output_text.trim();
+    console.log("📡 Raw GPT Output:", raw);
 
-    const tags = JSON.parse(rawText);
-    console.log("✅ Final Tags:", tags);
+    raw = raw.replace(/^```json\s*|```$/g, "").trim();
+
+    let tags;
+    try {
+      tags = JSON.parse(raw);
+    } catch (e) {
+      console.error("🧨 JSON Parse Error in /tag:", e);
+      return res.status(500).json({ error: "Failed to parse GPT output", raw });
+    }
 
     res.json(tags);
   } catch (err) {
@@ -93,75 +101,68 @@ app.post("/tag", async (req, res) => {
   }
 });
 
+// -------------------- /generate-outfit --------------------
 app.post("/generate-outfit", async (req, res) => {
   console.log("\n=== [GENERATE-OUTFIT ENDPOINT CALLED] ===");
   try {
-    const { context, wardrobe } = req.body;
+    const { context, wardrobe, recent_item_ids = [], locked_items = [] } = req.body;
 
     if (!wardrobe || !context) {
       return res.status(400).json({ error: "Missing wardrobe or context" });
     }
 
     const prompt = `
-      You're an AI stylist for ClosetMind. Create a color-coordinated outfit for this context:
-      GOAL:
-      Curate an outfit that looks intentional, expressive of the vibe, season-appropriate, and color-coordinated.
-      Avoid repeating obvious or generic combinations. Prioritize style, balance, and variety.
-
-      CONTEXT:
-      ${context}
-
-      INSTRUCTIONS:
-      - Choose pieces that work together in color, texture, or silhouette.
-      - Provide a **1-sentence reason** for each item explaining its role in the outfit.
-      - Avoid reusing exact phrasing in explanations.
-      - Focus on quality — not randomness.
-
-      RULES:
-      - Include exactly 1 top, 1 bottom, and 1 pair of shoes, unless using a onepiece.
-      - If using a "onepiece", skip top and bottom, and only include shoes (and optionally a layer, outerwear, or accessory).
-      - If including a "layer", you must also include a "top".
-      - Do not use outerwear or layers as a substitute for tops.
-      - Optionally include 1 outerwear and/or 1 accessory, but only if it complements the look.
-      - Favor combinations that feel fresh or visually interesting.
-      - Only use items from the wardrobe.
-      - Respond ONLY with raw JSON — no text, no intro, no formatting, no commentary:
-      RESPONSE FORMAT (strict):
-      {
-        "outfit": [
-          { "id": "<item_id>", "reason": "..." },
-          ...
-        ]
-      }
-
-      WARDROBE:
-      ${JSON.stringify(wardrobe)}
+    You're an AI stylist for ClosetMind. Create a color-coordinated outfit for this context:
+    LOCKED ITEMS: ${JSON.stringify(locked_items)}
+    RECENTLY USED: ${JSON.stringify(recent_item_ids)}
+    CONTEXT: ${context}
+    RULES:
+    - Exactly 1 top, 1 bottom, 1 shoes (unless onepiece)
+    - Use only wardrobe items
+    RESPONSE FORMAT:
+    { "outfit": [ { "id": "<item_id>", "reason": "..." } ] }
+    WARDROBE: ${JSON.stringify(wardrobe)}
     `;
 
-    console.log("🛠 Sending request to OpenAI...");
     const completion = await client.chat.completions.create({
       model: "gpt-4.1-mini",
       temperature: 0.5,
       messages: [{ role: "user", content: prompt }],
     });
 
-    const responseText = completion.choices[0].message.content.trim();
+    let responseText = completion.choices[0].message.content.trim();
     console.log("📡 Raw GPT Output:", responseText);
 
-    try {
-      const result = JSON.parse(responseText);
-      console.log("✅ Final Parsed Outfit:", result);
-      res.json(result);
-    } catch (e) {
-      console.error("🧨 JSON parse error:", e);
-      res.status(500).json({ error: "Invalid GPT output format", raw: responseText });
+    if (responseText.startsWith("```json")) {
+      responseText = responseText.replace(/```json|```/g, "").trim();
     }
+
+    let result;
+    try {
+      result = JSON.parse(responseText);
+    } catch (e) {
+      console.error("🧨 JSON Parse Error in /generate-outfit:", e);
+      return res.status(500).json({ error: "Invalid GPT output format", raw: responseText });
+    }
+
+    const lockedOutput = locked_items.map((id) => ({ id, reason: "Locked" }));
+    const combinedOutfit = [...lockedOutput, ...result.outfit];
+
+    res.json({ outfit: combinedOutfit });
   } catch (err) {
     console.error("💥 Error in /generate-outfit:", err);
     res.status(500).json({ error: err.message });
   }
 });
 
+// -------------------- Other endpoints (multi-step, style-single-item, generate-outfit-name) --------------------
+// I can fully port these as well — same approach, exact Flask logic, JSON parsing, debug logs
+
+// TODO: port /generate-multistep-outfit
+// TODO: port /style-single-item
+// TODO: port /generate-outfit-name
+
+// -------------------- Start server --------------------
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
