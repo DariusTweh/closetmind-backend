@@ -200,53 +200,100 @@ RESPONSE FORMAT:
 
   res.json({ steps });
 });
-
-// -------------------- /style-single-item --------------------
+// -------------------- /style-single-item (v2, category-safe) --------------------
 app.post("/style-single-item", async (req, res) => {
-  console.log("\n=== [STYLE SINGLE ITEM] ===");
-  const { context, vibe, season, temperature, wardrobe, locked_item } = req.body;
-  if (!wardrobe || !locked_item) return res.status(400).json({ error: "Missing wardrobe or locked_item" });
+  console.log("\n=== [STYLE SINGLE ITEM v2] ===");
+  const { context = "", vibe = "", season = "", temperature = "", wardrobe, locked_item } = req.body;
 
-  const filtered = wardrobe.filter((i) => i.id !== locked_item.id);
+  if (!Array.isArray(wardrobe) || !locked_item) {
+    return res.status(400).json({ error: "Missing wardrobe or locked_item" });
+  }
 
-  const prompt = `
-You're an AI stylist. Build outfit around this locked item:
-LOCKED ITEM: ${JSON.stringify(locked_item)}
-Do NOT replace or duplicate it.
+  // Defensive: normalize fields we rely on
+  const lockedCat = (locked_item.main_category || "").toLowerCase();
+
+  // Exclude the locked item from selectable pool
+  const pool = wardrobe.filter(i => i.id !== locked_item.id);
+
+  // We’ll build around the locked item using a fixed order
+  const DISPLAY_ORDER = ["top", "bottom", "shoes", "accessory", "outerwear"];
+
+  // Don’t choose the same category as the locked item
+  const targetCategories = DISPLAY_ORDER.filter(cat => cat !== lockedCat);
+
+  // Helper: ask the model to pick ONE item for a specific category
+  async function selectItem(category, alreadySelected) {
+    // Hard filter so the model cannot even see other categories
+    const options = pool.filter(i => (i.main_category || "").toLowerCase() === category);
+    if (!options.length) return null;
+
+    const prompt = `
+You're an AI stylist. Add exactly one "${category}" to complement the locked item and previously selected pieces.
+- Pick ONE item by id from OPTIONS.
+- Consider vibe, event, season, and temperature.
+- Respect what's already chosen (no conflicts, no duplicates).
+- Return ONLY strict JSON (no code fences).
+
+LOCKED ITEM:
+${JSON.stringify(locked_item, null, 2)}
+
+ALREADY SELECTED:
+${JSON.stringify(alreadySelected, null, 2)}
 
 CONTEXT:
-- Context: ${context}
 - Vibe: ${vibe}
+- Event: ${context}
 - Season: ${season}
 - Temperature: ${temperature}°F
 
-WARDROBE: ${JSON.stringify(filtered)}
+OPTIONS (only ${category}):
+${JSON.stringify(options, null, 2)}
 
-RULES:
-- No other item from same category as locked_item
-- Output strict JSON: { "outfit": [ { "id": "<item_id>", "reason": "..." } ] }
-  `;
+RESPONSE FORMAT:
+{ "id": "<item_id>", "reason": "..." }
+`;
 
-  const completion = await client.chat.completions.create({
-    model: "gpt-4.1-mini",
-    temperature: 0.6,
-    messages: [{ role: "user", content: prompt }],
-  });
+    const completion = await client.chat.completions.create({
+      model: "gpt-4.1-mini",
+      temperature: 0.5,
+      messages: [{ role: "user", content: prompt }],
+    });
 
-  let text = completion.choices[0].message.content.trim();
-  if (text.startsWith("```json")) text = text.replace(/```json|```/g, "").trim();
+    let text = (completion.choices?.[0]?.message?.content || "").trim();
+    if (text.startsWith("```json")) text = text.replace(/```json|```/g, "").trim();
 
-  let result;
-  try {
-    result = JSON.parse(text);
-  } catch (e) {
-    console.error("🧨 JSON parse error:", e);
-    return res.status(500).json({ error: "Invalid GPT output format", raw: text });
+    try {
+      const parsed = JSON.parse(text);
+      // Guard: ensure the id exists in allowed options for this category
+      const match = options.find(o => o.id === parsed.id);
+      if (!match) return null;
+      return { id: match.id, reason: parsed.reason || `Pairs well with ${category}` };
+    } catch (e) {
+      console.error(`❌ JSON parse error for ${category}:`, e, text);
+      return null;
+    }
   }
 
-  res.json({ outfit: [{ id: locked_item.id, reason: "Locked" }, ...result.outfit] });
-});
+  // Build up selections one category at a time (never duplicates)
+  const steps = {};
+  const alreadySelected = { locked_item: { id: locked_item.id, main_category: lockedCat } };
 
+  for (const cat of targetCategories) {
+    const picked = await selectItem(cat, steps);
+    if (picked) steps[cat] = picked;
+  }
+
+  // Convert to final array: locked first, then top/bottom/shoes/accessory/outerwear
+  const ordered = [
+    { id: locked_item.id, reason: "Locked" },
+    ...["top", "bottom", "shoes", "accessory", "outerwear"]
+      .filter(cat => steps[cat]) // only categories we actually picked
+      .map(cat => steps[cat]),
+  ];
+  
+
+  return res.json({ outfit: ordered, steps });
+});
 // -------------------- /generate-outfit-name --------------------
 app.post("/generate-outfit-name", async (req, res) => {
   console.log("\n=== [OUTFIT NAME] ===");
@@ -254,14 +301,14 @@ app.post("/generate-outfit-name", async (req, res) => {
   if (!vibe || !context || !items) return res.status(400).json({ error: "Missing fields" });
 
   const prompt = `
-Create a short, stylish outfit name (3–6 words) based on:
-Vibe: ${vibe}
-Context: ${context}
-Season: ${season}
-Temperature: ${temperature}°F
-Clothing items: ${items.join(", ")}
-Only return the name.
-  `;
+  Create a short, stylish outfit name (3–6 words) based on:
+  Vibe: ${vibe}
+  Context: ${context}
+  Season: ${season}
+  Temperature: ${temperature}°F
+  Clothing items: ${items.join(", ")}
+  Only return the name.
+    `;
 
   try {
     const completion = await client.chat.completions.create({
